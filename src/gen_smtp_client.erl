@@ -76,6 +76,8 @@
     Body :: string() | binary() | fun(() -> string() | binary())
 }.
 
+-type auth_mechanism() :: cram_md5 | login | plain | xoauth2.
+
 -type options() :: [
     {ssl, boolean()}
     | {tls, always | never | if_available}
@@ -87,7 +89,7 @@
     | {relay, inet:ip_address() | inet:hostname()}
     | {no_mx_lookups, boolean()}
     | {auth, always | never | if_available}
-    | {auth_mechanism, cram_md5 | login | plain | xoauth2}
+    | {auth_mechanism, auth_mechanism() | [auth_mechanism(), ...]}
     | {hostname, string()}
     | {retries, non_neg_integer()}
     | {username, string()}
@@ -641,6 +643,7 @@ do_AUTH(Socket, Username, Password, Types, Options) ->
     Preference =
         case proplists:get_value(auth_mechanism, Options) of
             undefined -> ?AUTH_PREFERENCE;
+            Mechanisms when is_list(Mechanisms) -> [auth_mechanism_name(M) || M <- Mechanisms];
             Mechanism -> [auth_mechanism_name(Mechanism)]
         end,
     AllowedTypes = [X || X <- Preference, lists:member(X, FixedTypes)],

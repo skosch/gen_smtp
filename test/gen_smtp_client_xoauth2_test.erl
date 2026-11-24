@@ -29,6 +29,32 @@ xoauth2_failure_reports_reason_test() ->
     %% forced mechanism: no LOGIN/PLAIN attempts with the token
     ?assertEqual([], [C || "AUTH LOGIN" ++ _ = C <- Cmds]).
 
+mechanism_list_is_a_priority_order_test() ->
+    %% server advertises LOGIN and XOAUTH2; the list decides which is tried first
+    {Port1, Server1} = start_server(),
+    Opts1 = lists:keystore(auth_mechanism, 1, opts(Port1, ?GOOD_TOKEN), {auth_mechanism, [xoauth2, login]}),
+    {ok, Sock1} = gen_smtp_client:open(Opts1),
+    gen_smtp_client:close(Sock1),
+    Cmds1 = stop_server(Server1),
+    ?assertEqual([], [C || "AUTH LOGIN" ++ _ = C <- Cmds1]),
+
+    {Port2, Server2} = start_server(),
+    Opts2 = lists:keystore(auth_mechanism, 1, opts(Port2, ?GOOD_TOKEN), {auth_mechanism, [login, xoauth2]}),
+    {ok, Sock2} = gen_smtp_client:open(Opts2),
+    gen_smtp_client:close(Sock2),
+    Cmds2 = stop_server(Server2),
+    ?assertMatch([_], [C || "AUTH LOGIN" ++ _ = C <- Cmds2]),
+    ?assertMatch([_], [C || "AUTH XOAUTH2 " ++ _ = C <- Cmds2]).
+
+mechanism_list_acts_as_allowlist_test() ->
+    %% PLAIN is not advertised and XOAUTH2 is not allowed: nothing to try
+    {Port, Server} = start_server(),
+    Opts = lists:keystore(auth_mechanism, 1, opts(Port, ?GOOD_TOKEN), {auth_mechanism, [plain, cram_md5]}),
+    Res = gen_smtp_client:open(Opts),
+    Cmds = stop_server(Server),
+    ?assertMatch({error, no_more_hosts, {permanent_failure, _, auth_failed}}, Res),
+    ?assertEqual([], [C || "AUTH " ++ _ = C <- Cmds]).
+
 without_mechanism_option_tries_other_mechanisms_first_test() ->
     {Port, Server} = start_server(),
     Opts = proplists:delete(auth_mechanism, opts(Port, ?GOOD_TOKEN)),
