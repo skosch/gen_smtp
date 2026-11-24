@@ -609,8 +609,6 @@ try_AUTH(Socket, Options, AuthTypes) ->
                 true ->
                     true;
                 Failed ->
-                    %% Failed is `false` or `{false, Reason}`; the latter carries the server's
-                    %% explanation (e.g. the decoded XOAUTH2 error JSON).
                     case proplists:get_value(auth, Options) of
                         always ->
                             quit(Socket),
