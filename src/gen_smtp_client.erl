@@ -690,10 +690,17 @@ do_AUTH_each(Socket, Username, Password, ["XOAUTH2" | Tail], Options) ->
             %% The server rejected the token and sent a base64 JSON error as a challenge.
             %% Per the XOAUTH2 protocol the client must answer with an empty line, after
             %% which the server sends the final failure response.
-            Reason = decode_xoauth2_error(Challenge),
+            ChallengeError = decode_xoauth2_error(Challenge),
             smtp_socket:send(Socket, "\r\n"),
-            Final = read_possible_multiline_reply(Socket),
-            trace(Options, "XOAUTH2 authentication rejected: ~s (~p)~n", [Reason, Final]),
+            Reason =
+                case read_possible_multiline_reply(Socket) of
+                    {ok, Final} ->
+                        FinalMsg = binstr:strip(binstr:strip(Final, right, $\n), right, $\r),
+                        <<ChallengeError/binary, " | ", FinalMsg/binary>>;
+                    _ ->
+                        ChallengeError
+                end,
+            trace(Options, "XOAUTH2 authentication rejected: ~s~n", [Reason]),
             xoauth2_failed(Socket, Username, Password, Tail, Options, Reason);
         {ok, Msg} ->
             Reason = binstr:strip(binstr:strip(Msg, right, $\n), right, $\r),
