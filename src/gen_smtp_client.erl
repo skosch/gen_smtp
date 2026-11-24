@@ -87,6 +87,7 @@
     | {relay, inet:ip_address() | inet:hostname()}
     | {no_mx_lookups, boolean()}
     | {auth, always | never | if_available}
+    | {auth_mechanism, cram_md5 | login | plain | xoauth2}
     | {hostname, string()}
     | {retries, non_neg_integer()}
     | {username, string()}
@@ -120,6 +121,7 @@
 -type permanent_failure_reason() ::
     binary()
     | auth_failed
+    | {auth_failed, binary()}
     | ssl_not_started.
 %server's 4xx response
 -type temporary_failure_reason() ::
@@ -604,18 +606,23 @@ try_AUTH(Socket, Options, AuthTypes) ->
             trace(Options, "Auth types: ~p~n", [AuthTypes]),
             Types = re:split(AuthTypes, " ", [{return, list}, trim]),
             case do_AUTH(Socket, Username, Password, Types, Options) of
-                false ->
+                true ->
+                    true;
+                Failed ->
+                    %% Failed is `false` or `{false, Reason}`; the latter carries the server's
+                    %% explanation (e.g. the decoded XOAUTH2 error JSON).
                     case proplists:get_value(auth, Options) of
                         always ->
                             quit(Socket),
-                            erlang:throw({permanent_failure, auth_failed});
+                            erlang:throw({permanent_failure, auth_failure_reason(Failed)});
                         _ ->
                             false
-                    end;
-                true ->
-                    true
+                    end
             end
     end.
+
+auth_failure_reason({false, Reason}) -> {auth_failed, Reason};
+auth_failure_reason(false) -> auth_failed.
 
 to_string(String) when is_list(String) -> String;
 to_string(Binary) when is_binary(Binary) -> binary_to_list(Binary).
@@ -629,11 +636,16 @@ to_binary(String) when is_list(String) -> list_to_binary(String).
     Password :: binary(),
     Types :: [string()],
     Options :: options()
-) -> boolean().
+) -> boolean() | {false, binary()}.
 do_AUTH(Socket, Username, Password, Types, Options) ->
     FixedTypes = [string:to_upper(X) || X <- Types],
     trace(Options, "Fixed types: ~p~n", [FixedTypes]),
-    AllowedTypes = [X || X <- ?AUTH_PREFERENCE, lists:member(X, FixedTypes)],
+    Preference =
+        case proplists:get_value(auth_mechanism, Options) of
+            undefined -> ?AUTH_PREFERENCE;
+            Mechanism -> [auth_mechanism_name(Mechanism)]
+        end,
+    AllowedTypes = [X || X <- Preference, lists:member(X, FixedTypes)],
     trace(Options, "available authentication types, in order of preference: ~p~n", [AllowedTypes]),
     do_AUTH_each(Socket, Username, Password, AllowedTypes, Options).
 
@@ -643,7 +655,7 @@ do_AUTH(Socket, Username, Password, Types, Options) ->
     Password :: binary(),
     AuthTypes :: [string()],
     Options :: options()
-) -> boolean().
+) -> boolean() | {false, binary()}.
 do_AUTH_each(_Socket, _Username, _Password, [], _Options) ->
     false;
 do_AUTH_each(Socket, Username, Password, ["CRAM-MD5" | Tail], Options) ->
@@ -672,9 +684,21 @@ do_AUTH_each(Socket, Username, Password, ["XOAUTH2" | Tail], Options) ->
     smtp_socket:send(Socket, ["AUTH XOAUTH2 ", Str, "\r\n"]),
     case read_possible_multiline_reply(Socket) of
         {ok, <<"235", _Rest/binary>>} ->
+            trace(Options, "authentication accepted~n", []),
             true;
-        {ok, _Msg} ->
-            do_AUTH_each(Socket, Username, Password, Tail, Options)
+        {ok, <<"334 ", Challenge/binary>>} ->
+            %% The server rejected the token and sent a base64 JSON error as a challenge.
+            %% Per the XOAUTH2 protocol the client must answer with an empty line, after
+            %% which the server sends the final failure response.
+            Reason = decode_xoauth2_error(Challenge),
+            smtp_socket:send(Socket, "\r\n"),
+            Final = read_possible_multiline_reply(Socket),
+            trace(Options, "XOAUTH2 authentication rejected: ~s (~p)~n", [Reason, Final]),
+            xoauth2_failed(Socket, Username, Password, Tail, Options, Reason);
+        {ok, Msg} ->
+            Reason = binstr:strip(binstr:strip(Msg, right, $\n), right, $\r),
+            trace(Options, "XOAUTH2 authentication rejected: ~s~n", [Reason]),
+            xoauth2_failed(Socket, Username, Password, Tail, Options, Reason)
     end;
 do_AUTH_each(Socket, Username, Password, ["LOGIN" | Tail], Options) ->
     smtp_socket:send(Socket, "AUTH LOGIN\r\n"),
@@ -723,6 +747,24 @@ do_AUTH_each(Socket, Username, Password, ["PLAIN" | Tail], Options) ->
 do_AUTH_each(Socket, Username, Password, [Type | Tail], Options) ->
     trace(Options, "unsupported AUTH type ~s~n", [Type]),
     do_AUTH_each(Socket, Username, Password, Tail, Options).
+
+xoauth2_failed(_Socket, _Username, _Password, [], _Options, Reason) ->
+    {false, Reason};
+xoauth2_failed(Socket, Username, Password, Tail, Options, _Reason) ->
+    do_AUTH_each(Socket, Username, Password, Tail, Options).
+
+decode_xoauth2_error(Challenge) ->
+    Stripped = binstr:strip(binstr:strip(Challenge, right, $\n), right, $\r),
+    try
+        base64:decode(Stripped)
+    catch
+        _:_ -> Stripped
+    end.
+
+auth_mechanism_name(cram_md5) -> "CRAM-MD5";
+auth_mechanism_name(login) -> "LOGIN";
+auth_mechanism_name(plain) -> "PLAIN";
+auth_mechanism_name(xoauth2) -> "XOAUTH2".
 
 is_auth_username_prompt(<<"334 VXNlcm5hbWU6\r\n">>) -> true;
 is_auth_username_prompt(<<"334 dXNlcm5hbWU6\r\n">>) -> true;
