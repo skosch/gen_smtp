@@ -29,6 +29,38 @@ xoauth2_failure_reports_reason_test() ->
     %% forced mechanism: no LOGIN/PLAIN attempts with the token
     ?assertEqual([], [C || "AUTH LOGIN" ++ _ = C <- Cmds]).
 
+%% Published examples. The documented prefixes of the encoded strings are
+%% "dXNlcj1zb21ldXNlckBleGFtcGxlLmNvbQFhdXRoPUJlYXJlciB5YTI5" (Google) and
+%% "dXNlcj10ZXN0QGNvbnRvc28ub25taWNyb3NvZnQuY29tAWF1dGg9QmVhcmVy" (Microsoft);
+%% the full strings below are the base64 of the documented pre-encoding examples.
+google_documented_example_is_sent_byte_for_byte_test() ->
+    %% https://developers.google.com/workspace/gmail/imap/xoauth2-protocol
+    Expected =
+        "dXNlcj1zb21ldXNlckBleGFtcGxlLmNvbQFhdXRoPUJlYXJlciB5YTI5LnZGOWRmdDRxbVRjMk52YjNSbGNrQmhkSFJoZG1semRHRXVZMjl0Q2cBAQ==",
+    assert_initial_response(
+        "someuser@example.com", "ya29.vF9dft4qmTc2Nvb3RlckBhdHRhdmlzdGEuY29tCg", Expected
+    ).
+
+microsoft_documented_example_is_sent_byte_for_byte_test() ->
+    %% https://learn.microsoft.com/en-us/exchange/client-developer/legacy-protocols/how-to-authenticate-an-imap-pop-smtp-application-by-using-oauth
+    Expected =
+        "dXNlcj10ZXN0QGNvbnRvc28ub25taWNyb3NvZnQuY29tAWF1dGg9QmVhcmVyIEV3QkFBbDNCQUFVRkZwVUFvN0ozVmUwYmpMQldaV0NjbFJDM0VvQUEBAQ==",
+    assert_initial_response(
+        "test@contoso.onmicrosoft.com", "EwBAAl3BAAUFFpUAo7J3Ve0bjLBWZWCclRC3EoAA", Expected
+    ).
+
+google_documented_failure_transcript_test() ->
+    %% Google's SMTP failure example: 334 with the documented JSON error, client answers with
+    %% an empty line, server then sends a multi-line 535 reply.
+    {Port, Server} = start_server(),
+    Res = gen_smtp_client:open(opts(Port, "someuser@example.com", "google-transcript")),
+    Cmds = stop_server(Server),
+    ?assert(lists:member("", Cmds)),
+    {error, no_more_hosts, {permanent_failure, _, {auth_failed, Reason}}} = Res,
+    ?assertMatch({_, _}, binary:match(Reason, <<"\"scope\":\"https://mail.google.com/\"">>)),
+    ?assertMatch({_, _}, binary:match(Reason, <<"535-5.7.1 Username and Password not accepted">>)),
+    ?assertMatch({_, _}, binary:match(Reason, <<"https://support.google.com/mail/?p=BadCredentials">>)).
+
 long_token_does_not_use_initial_response_test() ->
     %% RFC 4954 section 4: AUTH line over 512 octets must not carry the initial response
     {Port, Server} = start_server(),
@@ -105,7 +137,16 @@ without_mechanism_option_tries_other_mechanisms_first_test() ->
     %% default behaviour is unchanged: LOGIN is attempted before XOAUTH2
     ?assertMatch([_ | _], [C || "AUTH LOGIN" ++ _ = C <- Cmds]).
 
+assert_initial_response(User, Token, ExpectedB64) ->
+    {Port, Server} = start_server(),
+    _ = gen_smtp_client:open([{retries, 0} | opts(Port, User, Token)]),
+    Cmds = stop_server(Server),
+    ?assert(lists:member("AUTH XOAUTH2 " ++ ExpectedB64, Cmds)).
+
 opts(Port, Token) ->
+    opts(Port, "user@example.com", Token).
+
+opts(Port, User, Token) ->
     [
         {relay, "127.0.0.1"},
         {port, Port},
@@ -113,7 +154,7 @@ opts(Port, Token) ->
         {tls, never},
         {auth, always},
         {auth_mechanism, xoauth2},
-        {username, "user@example.com"},
+        {username, User},
         {password, Token},
         {hostname, "localhost"}
     ].
@@ -169,6 +210,17 @@ handle(S, "AUTH XOAUTH2 " ++ B64, Acc) ->
         Expected ->
             send(S, "235 2.7.0 Authentication successful\r\n"),
             loop(S, Acc);
+        _ when B64Token =:= "google-transcript" ->
+            Err = base64:encode(
+                <<"{\"status\":\"401\", \"schemes\":\"bearer\", \"scope\":\"https://mail.google.com/\"}">>
+            ),
+            send(S, ["334 ", Err, "\r\n"]),
+            {ok, Empty} = gen_tcp:recv(S, 0, 5000),
+            send(S, [
+                "535-5.7.1 Username and Password not accepted. Learn more at\r\n",
+                "535 5.7.1 https://support.google.com/mail/?p=BadCredentials hx9sm5317360pbc.68\r\n"
+            ]),
+            loop(S, [chomp(Empty) | Acc]);
         _ when B64Token =:= "temp-fail" ->
             send(S, "454 4.7.0 Temporary authentication failure\r\n"),
             loop(S, Acc);
