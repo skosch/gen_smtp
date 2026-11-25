@@ -617,15 +617,16 @@ try_AUTH(Socket, Options, AuthTypes) ->
                     case proplists:get_value(auth, Options) of
                         always ->
                             quit(Socket),
-                            erlang:throw({permanent_failure, auth_failure_reason(Failed)});
+                            erlang:throw(auth_failure(Failed));
                         _ ->
                             false
                     end
             end
     end.
 
-auth_failure_reason({false, Reason}) -> {auth_failed, Reason};
-auth_failure_reason(false) -> auth_failed.
+auth_failure({temporary, Reason}) -> {temporary_failure, Reason};
+auth_failure({false, Reason}) -> {permanent_failure, {auth_failed, Reason}};
+auth_failure(false) -> {permanent_failure, auth_failed}.
 
 to_string(String) when is_list(String) -> String;
 to_string(Binary) when is_binary(Binary) -> binary_to_list(Binary).
@@ -639,7 +640,7 @@ to_binary(String) when is_list(String) -> list_to_binary(String).
     Password :: binary(),
     Types :: [string()],
     Options :: options()
-) -> boolean() | {false, binary()}.
+) -> boolean() | {false, binary()} | {temporary, binary()}.
 do_AUTH(Socket, Username, Password, Types, Options) ->
     FixedTypes = [string:to_upper(X) || X <- Types],
     trace(Options, "Fixed types: ~p~n", [FixedTypes]),
@@ -659,7 +660,7 @@ do_AUTH(Socket, Username, Password, Types, Options) ->
     Password :: binary(),
     AuthTypes :: [string()],
     Options :: options()
-) -> boolean() | {false, binary()}.
+) -> boolean() | {false, binary()} | {temporary, binary()}.
 do_AUTH_each(_Socket, _Username, _Password, [], _Options) ->
     false;
 do_AUTH_each(Socket, Username, Password, ["CRAM-MD5" | Tail], Options) ->
@@ -695,20 +696,20 @@ do_AUTH_each(Socket, Username, Password, ["XOAUTH2" | Tail], Options) ->
             %% which the server sends the final failure response.
             ChallengeError = decode_xoauth2_error(Challenge),
             smtp_socket:send(Socket, "\r\n"),
-            Reason =
+            {Kind, Reason} =
                 case read_possible_multiline_reply(Socket) of
                     {ok, Final} ->
                         FinalMsg = binstr:strip(binstr:strip(Final, right, $\n), right, $\r),
-                        <<ChallengeError/binary, " | ", FinalMsg/binary>>;
+                        {reply_kind(Final), <<ChallengeError/binary, " | ", FinalMsg/binary>>};
                     _ ->
-                        ChallengeError
+                        {permanent, ChallengeError}
                 end,
             trace(Options, "XOAUTH2 authentication rejected: ~s~n", [Reason]),
-            xoauth2_failed(Socket, Username, Password, Tail, Options, Reason);
+            xoauth2_failed(Socket, Username, Password, Tail, Options, Kind, Reason);
         {ok, Msg} ->
             Reason = binstr:strip(binstr:strip(Msg, right, $\n), right, $\r),
             trace(Options, "XOAUTH2 authentication rejected: ~s~n", [Reason]),
-            xoauth2_failed(Socket, Username, Password, Tail, Options, Reason)
+            xoauth2_failed(Socket, Username, Password, Tail, Options, reply_kind(Msg), Reason)
     end;
 do_AUTH_each(Socket, Username, Password, ["LOGIN" | Tail], Options) ->
     smtp_socket:send(Socket, "AUTH LOGIN\r\n"),
@@ -779,10 +780,17 @@ xoauth2_exchange(Socket, Response) ->
             end
     end.
 
-xoauth2_failed(_Socket, _Username, _Password, [], _Options, Reason) ->
+%% RFC 4954 section 6: 454 is a temporary failure (e.g. throttling) and not a rejection of the
+%% credentials, so there's no point in trying other mechanisms.
+xoauth2_failed(_Socket, _Username, _Password, _Tail, _Options, temporary, Reason) ->
+    {temporary, Reason};
+xoauth2_failed(_Socket, _Username, _Password, [], _Options, permanent, Reason) ->
     {false, Reason};
-xoauth2_failed(Socket, Username, Password, Tail, Options, _Reason) ->
+xoauth2_failed(Socket, Username, Password, Tail, Options, permanent, _Reason) ->
     do_AUTH_each(Socket, Username, Password, Tail, Options).
+
+reply_kind(<<"4", _/binary>>) -> temporary;
+reply_kind(_) -> permanent.
 
 decode_xoauth2_error(Challenge) ->
     Stripped = binstr:strip(

@@ -47,6 +47,21 @@ short_token_uses_initial_response_test() ->
     ?assertNot(lists:member("AUTH XOAUTH2", Cmds)),
     ?assertMatch([_], [C || "AUTH XOAUTH2 " ++ _ = C <- Cmds]).
 
+temporary_failure_is_reported_as_temporary_test() ->
+    %% RFC 4954 section 6: 454 is a temporary failure
+    {Port, Server} = start_server(),
+    Res = gen_smtp_client:open([{retries, 0} | opts(Port, "temp-fail")]),
+    Cmds = stop_server(Server),
+    ?assertMatch({error, _, {temporary_failure, _, <<"454", _/binary>>}}, Res),
+    ?assertEqual([], [C || "AUTH LOGIN" ++ _ = C <- Cmds]).
+
+temporary_failure_after_error_challenge_test() ->
+    {Port, Server} = start_server(),
+    Res = gen_smtp_client:open([{retries, 0} | opts(Port, "temp-334")]),
+    Cmds = stop_server(Server),
+    ?assertMatch({error, _, {temporary_failure, _, <<"{\"status\":\"401\"", _/binary>>}}, Res),
+    ?assert(lists:member("", Cmds)).
+
 bare_334_challenge_is_acknowledged_test() ->
     %% RFC 5321 4.2: replies without a trailing space after the code must be accepted
     {Port, Server} = start_server(),
@@ -154,6 +169,15 @@ handle(S, "AUTH XOAUTH2 " ++ B64, Acc) ->
         Expected ->
             send(S, "235 2.7.0 Authentication successful\r\n"),
             loop(S, Acc);
+        _ when B64Token =:= "temp-fail" ->
+            send(S, "454 4.7.0 Temporary authentication failure\r\n"),
+            loop(S, Acc);
+        _ when B64Token =:= "temp-334" ->
+            Err = base64:encode(<<"{\"status\":\"401\",\"schemes\":\"Bearer\"}">>),
+            send(S, ["334 ", Err, "\r\n"]),
+            {ok, Empty} = gen_tcp:recv(S, 0, 5000),
+            send(S, "454 4.7.0 Too many login attempts\r\n"),
+            loop(S, [chomp(Empty) | Acc]);
         _ when B64Token =:= "bare-334" ->
             send(S, "334\r\n"),
             {ok, Empty} = gen_tcp:recv(S, 0, 5000),
