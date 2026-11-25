@@ -50,6 +50,9 @@
 
 -define(TIMEOUT, 1200000).
 
+% RFC 5321 4.5.3.1.4: maximum command line length including CRLF
+-define(MAX_COMMAND_LENGTH, 512).
+
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
 -compile([export_all, nowarn_export_all]).
@@ -682,8 +685,7 @@ do_AUTH_each(Socket, Username, Password, ["CRAM-MD5" | Tail], Options) ->
     end;
 do_AUTH_each(Socket, Username, Password, ["XOAUTH2" | Tail], Options) ->
     Str = base64:encode(list_to_binary(["user=", Username, 1, "auth=Bearer ", Password, 1, 1])),
-    smtp_socket:send(Socket, ["AUTH XOAUTH2 ", Str, "\r\n"]),
-    case read_possible_multiline_reply(Socket) of
+    case xoauth2_exchange(Socket, Str) of
         {ok, <<"235", _Rest/binary>>} ->
             trace(Options, "authentication accepted~n", []),
             true;
@@ -755,6 +757,27 @@ do_AUTH_each(Socket, Username, Password, ["PLAIN" | Tail], Options) ->
 do_AUTH_each(Socket, Username, Password, [Type | Tail], Options) ->
     trace(Options, "unsupported AUTH type ~s~n", [Type]),
     do_AUTH_each(Socket, Username, Password, Tail, Options).
+
+%% RFC 4954 section 4: the AUTH command is subject to the SMTP command line limit (512 octets,
+%% RFC 5321 4.5.3.1.4) and "the client MUST NOT use the initial response parameter" if that would
+%% exceed it. OAuth access tokens are often longer than that, so in that case the response is
+%% sent as a separate line after an empty server challenge.
+xoauth2_exchange(Socket, Response) ->
+    Command = ["AUTH XOAUTH2 ", Response, "\r\n"],
+    case iolist_size(Command) =< ?MAX_COMMAND_LENGTH of
+        true ->
+            smtp_socket:send(Socket, Command),
+            read_possible_multiline_reply(Socket);
+        false ->
+            smtp_socket:send(Socket, "AUTH XOAUTH2\r\n"),
+            case read_possible_multiline_reply(Socket) of
+                {ok, <<"334", _/binary>>} ->
+                    smtp_socket:send(Socket, [Response, "\r\n"]),
+                    read_possible_multiline_reply(Socket);
+                Other ->
+                    Other
+            end
+    end.
 
 xoauth2_failed(_Socket, _Username, _Password, [], _Options, Reason) ->
     {false, Reason};

@@ -29,6 +29,24 @@ xoauth2_failure_reports_reason_test() ->
     %% forced mechanism: no LOGIN/PLAIN attempts with the token
     ?assertEqual([], [C || "AUTH LOGIN" ++ _ = C <- Cmds]).
 
+long_token_does_not_use_initial_response_test() ->
+    %% RFC 4954 section 4: AUTH line over 512 octets must not carry the initial response
+    {Port, Server} = start_server(),
+    Token = "long-" ++ lists:duplicate(1500, $a),
+    {ok, Sock} = gen_smtp_client:open(opts(Port, Token)),
+    gen_smtp_client:close(Sock),
+    Cmds = stop_server(Server),
+    ?assert(lists:member("AUTH XOAUTH2", Cmds)),
+    ?assertEqual([], [C || "AUTH XOAUTH2 " ++ _ = C <- Cmds]).
+
+short_token_uses_initial_response_test() ->
+    {Port, Server} = start_server(),
+    {ok, Sock} = gen_smtp_client:open(opts(Port, ?GOOD_TOKEN)),
+    gen_smtp_client:close(Sock),
+    Cmds = stop_server(Server),
+    ?assertNot(lists:member("AUTH XOAUTH2", Cmds)),
+    ?assertMatch([_], [C || "AUTH XOAUTH2 " ++ _ = C <- Cmds]).
+
 bare_334_challenge_is_acknowledged_test() ->
     %% RFC 5321 4.2: replies without a trailing space after the code must be accepted
     {Port, Server} = start_server(),
@@ -118,6 +136,15 @@ handle(S, "EHLO" ++ _, Acc) ->
 handle(S, "AUTH LOGIN" ++ _, Acc) ->
     send(S, "535 5.7.3 Authentication unsuccessful\r\n"),
     loop(S, Acc);
+handle(S, "AUTH XOAUTH2", Acc) ->
+    send(S, "334 \r\n"),
+    {ok, Line} = gen_tcp:recv(S, 0, 5000),
+    B64 = chomp(Line),
+    case is_valid(token_of(B64)) of
+        true -> send(S, "235 2.7.0 Authentication successful\r\n");
+        false -> send(S, "535 5.7.3 Authentication unsuccessful\r\n")
+    end,
+    loop(S, ["AUTH XOAUTH2" | Acc]);
 handle(S, "AUTH XOAUTH2 " ++ B64, Acc) ->
     Expected = base64:encode(
         list_to_binary(["user=user@example.com", 1, "auth=Bearer ", ?GOOD_TOKEN, 1, 1])
@@ -147,6 +174,8 @@ handle(S, _, Acc) ->
     loop(S, Acc).
 
 send(S, Data) -> gen_tcp:send(S, Data).
+
+is_valid(Token) -> Token =:= ?GOOD_TOKEN orelse lists:prefix("long-", Token).
 
 token_of(B64) ->
     [_, Rest] = binary:split(base64:decode(list_to_binary(B64)), <<"auth=Bearer ">>),
