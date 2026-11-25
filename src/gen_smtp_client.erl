@@ -687,7 +687,7 @@ do_AUTH_each(Socket, Username, Password, ["XOAUTH2" | Tail], Options) ->
         {ok, <<"235", _Rest/binary>>} ->
             trace(Options, "authentication accepted~n", []),
             true;
-        {ok, <<"334 ", Challenge/binary>>} ->
+        {ok, <<"334", Challenge/binary>>} ->
             %% The server rejected the token and sent a base64 JSON error as a challenge.
             %% Per the XOAUTH2 protocol the client must answer with an empty line, after
             %% which the server sends the final failure response.
@@ -762,7 +762,9 @@ xoauth2_failed(Socket, Username, Password, Tail, Options, _Reason) ->
     do_AUTH_each(Socket, Username, Password, Tail, Options).
 
 decode_xoauth2_error(Challenge) ->
-    Stripped = binstr:strip(binstr:strip(Challenge, right, $\n), right, $\r),
+    Stripped = binstr:strip(
+        binstr:strip(binstr:strip(Challenge, right, $\n), right, $\r), left, $\s
+    ),
     try
         base64:decode(Stripped)
     catch
@@ -954,7 +956,8 @@ read_possible_multiline_reply(Socket) ->
                 <<"-">> ->
                     Code = binstr:substr(Packet, 1, 3),
                     read_multiline_reply(Socket, Code, [Packet]);
-                <<" ">> ->
+                Sep when Sep =:= <<" ">>; Sep =:= <<"\r">>; Sep =:= <<"\n">> ->
+                    %% RFC 5321 4.2: a reply may consist of just the code (no space, no text)
                     {ok, Packet};
                 _ ->
                     quit(Socket),
@@ -970,7 +973,7 @@ read_multiline_reply(Socket, Code, Acc) ->
     case smtp_socket:recv(Socket, 0, ?TIMEOUT) of
         {ok, Packet} ->
             case {binstr:substr(Packet, 1, 3), binstr:substr(Packet, 4, 1)} of
-                {Code, <<" ">>} ->
+                {Code, Sep} when Sep =:= <<" ">>; Sep =:= <<"\r">>; Sep =:= <<"\n">> ->
                     {ok, list_to_binary(lists:reverse([Packet | Acc]))};
                 {Code, <<"-">>} ->
                     read_multiline_reply(Socket, Code, [Packet | Acc]);

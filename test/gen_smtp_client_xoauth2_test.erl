@@ -29,6 +29,14 @@ xoauth2_failure_reports_reason_test() ->
     %% forced mechanism: no LOGIN/PLAIN attempts with the token
     ?assertEqual([], [C || "AUTH LOGIN" ++ _ = C <- Cmds]).
 
+bare_334_challenge_is_acknowledged_test() ->
+    %% RFC 5321 4.2: replies without a trailing space after the code must be accepted
+    {Port, Server} = start_server(),
+    Res = gen_smtp_client:open(opts(Port, "bare-334")),
+    Cmds = stop_server(Server),
+    ?assertMatch({error, no_more_hosts, {permanent_failure, _, {auth_failed, _}}}, Res),
+    ?assert(lists:member("", Cmds)).
+
 mechanism_list_is_a_priority_order_test() ->
     %% server advertises LOGIN and XOAUTH2; the list decides which is tried first
     {Port1, Server1} = start_server(),
@@ -114,10 +122,16 @@ handle(S, "AUTH XOAUTH2 " ++ B64, Acc) ->
     Expected = base64:encode(
         list_to_binary(["user=user@example.com", 1, "auth=Bearer ", ?GOOD_TOKEN, 1, 1])
     ),
+    B64Token = token_of(B64),
     case list_to_binary(B64) of
         Expected ->
             send(S, "235 2.7.0 Authentication successful\r\n"),
             loop(S, Acc);
+        _ when B64Token =:= "bare-334" ->
+            send(S, "334\r\n"),
+            {ok, Empty} = gen_tcp:recv(S, 0, 5000),
+            send(S, "535 5.7.3 Authentication unsuccessful\r\n"),
+            loop(S, [chomp(Empty) | Acc]);
         _ ->
             Err = base64:encode(<<"{\"status\":\"401\",\"schemes\":\"Bearer\"}">>),
             send(S, ["334 ", Err, "\r\n"]),
@@ -133,5 +147,10 @@ handle(S, _, Acc) ->
     loop(S, Acc).
 
 send(S, Data) -> gen_tcp:send(S, Data).
+
+token_of(B64) ->
+    [_, Rest] = binary:split(base64:decode(list_to_binary(B64)), <<"auth=Bearer ">>),
+    [Token | _] = binary:split(Rest, <<1>>),
+    binary_to_list(Token).
 
 chomp(Bin) -> string:trim(binary_to_list(Bin), trailing, [[$\r, $\n]]).
